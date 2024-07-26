@@ -1,0 +1,113 @@
+# This Python 3 environment comes with many helpful analytics libraries installed
+# It is defined by the kaggle/python Docker image: https://github.com/kaggle/docker-python
+# For example, here's several helpful packages to load
+
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
+
+# Input data files are available in the read-only "../input/" directory
+# For example, running this (by clicking run or pressing Shift+Enter) will list all files under the input directory
+
+import os
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# You can write up to 20GB to the current directory (/kaggle/working/) that gets preserved as output when you create a version using "Save & Run All" 
+# You can also write temporary files to /kaggle/temp/, but they won't be saved outside of the current session
+!nvidia-smi
+pip install evaluate
+pip install peft
+import os
+import sys
+import logging
+import datasets
+import evaluate#评估模块
+import pandas as pd
+import numpy as np
+from transformers import AutoModelForSequenceClassification, DebertaV2Tokenizer, DataCollatorWithPadding
+from transformers import Trainer,TrainingArguments
+from peft import LoraConfig,get_peft_model,prepare_model_for_kbit_training,TaskType
+from sklearn.model_selection import train_test_split
+train=pd.read_csv("/kaggle/input/cola-data/CoLA/train.tsv", header=0, delimiter="\t", quoting=3)
+test=pd.read_csv("/kaggle/input/cola-data/CoLA/test.tsv", header=0, delimiter="\t", quoting=3)
+# 设置日志记录
+program = os.path.basename(sys.argv[0])
+logger = logging.getLogger(program)
+
+logging.basicConfig(format='%(asctime)s: %(levelname)s: %(message)s')
+logging.root.setLevel(level=logging.INFO)
+logger.info(r"running %s" % ''.join(sys.argv))
+ # 划分训练集和验证集
+train, val = train_test_split(train, test_size=.2)
+train_dict={'label':train.iloc[:,1],'text':train.iloc[:,3]}
+val_dict={'label': val.iloc[:,1], 'text': val.iloc[:,3]}
+test_dict={'text': test.iloc[:,1], }
+train_dataset=datasets.Dataset.from_dict(train_dict)
+val_dataset=datasets.Dataset.from_dict(val_dict)
+test_dataset=datasets.Dataset.from_dict(test_dict)
+batch_size=32
+# 选择预训练模型
+model_id = "microsoft/deberta-v2-xxlarge"
+#创建分词器
+tokenizer=DebertaV2Tokenizer.from_pretrained(model_id)
+def preprocess_function(examples):
+    return tokenizer(examples['text'],truncation=True)
+tokenized_train=train_dataset.map(preprocess_function,batched=True)
+tokenized_val = val_dataset.map(preprocess_function, batched=True)
+tokenized_test = test_dataset.map(preprocess_function, batched=True)
+data_collator=DataCollatorWithPadding(tokenizer=tokenizer)
+model=AutoModelForSequenceClassification.from_pretrained(
+model_id,
+)
+lora_config=LoraConfig(
+r=16,#低rank
+lora_alpha=23,#权重系数
+lora_dropout=0.05,#lora的概率
+bias="none",#不用偏置项
+task_type= TaskType.SEQ_CLS#序列分类
+)
+model=get_peft_model(model,lora_config)
+model.print_trainable_parameters()
+metric=evaluate.load("accuracy")
+def compute_metrics(eval_pred):
+    logits,labels=eval_pred
+    predictions=np.argmax(logits,axis=-1)
+    return metric.compute(predictions=predictions,references=labels)
+    # 训练参数设置
+    training_args = TrainingArguments(
+        output_dir='./checkpoint',  # 输出目录
+        num_train_epochs=3,  # 训练的总epoch数
+        per_device_train_batch_size=2,  # 训练时每个设备的batch size
+        per_device_eval_batch_size=4,  # 评估时每个设备的batch size
+        warmup_steps=500,  # 学习率调度的预热步数
+        weight_decay=0.01,  # 权重衰减
+        logging_dir='./logs',  # 日志存储目录
+        logging_steps=100,
+        save_strategy="no",
+        evaluation_strategy="epoch"
+    )
+
+    # 创建Trainer实例
+    trainer = Trainer(
+        model=model,  # 要训练的模型
+        args=training_args,  # 训练参数
+        train_dataset=tokenized_train,  # 训练数据集
+        eval_dataset=tokenized_val,  # 评估数据集
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+    !wandb off
+    # 开始训练
+    trainer.train()
+
+    # 预测测试集
+    prediction_outputs = trainer.predict(tokenized_test)
+    test_pred = np.argmax(prediction_outputs[0], axis=-1).flatten()
+    print(test_pred)
+
+    # 保存结果
+    result_output = pd.DataFrame(data={"id": test["index"], "sentiment": test_pred})
+    result_output.to_csv("/kaggle/working/deberta_lora_int8.csv", index=False, quoting=3)
+    logging.info('result saved!')
